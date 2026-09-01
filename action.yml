@@ -10,9 +10,9 @@ inputs:
     required: false
     default: ${{ github.token }}
   calls-per-month:
-    description: "Assumed monthly call volume per call site"
+    description: "Assumed monthly call volume per call site. Leave empty to use .tokentoll.yml's calls_per_month (default 1000)"
     required: false
-    default: "1000"
+    default: ""
   base-ref:
     description: "Base git ref for comparison (default: PR base)"
     required: false
@@ -23,11 +23,18 @@ inputs:
     description: "Python version to use"
     required: false
     default: "3.11"
+  fail-on-policy-violation:
+    description: "Fail the action if the configured policy fails (default: false)"
+    required: false
+    default: "false"
 
 outputs:
   monthly-delta:
     description: "Net monthly cost delta (positive = more expensive)"
     value: ${{ steps.run.outputs.monthly-delta }}
+  verdict:
+    description: "Policy verdict: pass, warn, or fail"
+    value: ${{ steps.run.outputs.verdict }}
 
 runs:
   using: "composite"
@@ -39,7 +46,7 @@ runs:
 
     - name: Install tokentoll
       shell: bash
-      run: pip install 'tokentoll==0.6.1'
+      run: pip install 'tokentoll==0.8.3'
 
     - name: Run analysis
       id: run
@@ -49,42 +56,44 @@ runs:
         INPUT_BASE_REF: ${{ inputs.base-ref || github.event.pull_request.base.sha }}
         INPUT_HEAD_REF: ${{ inputs.head-ref || github.event.pull_request.head.sha }}
       run: |
+        CPM_FLAG=""
+        if [ -n "${INPUT_CALLS_PER_MONTH}" ]; then
+          CPM_FLAG="--calls-per-month=${INPUT_CALLS_PER_MONTH}"
+        fi
+
         DIFF_JSON=$(tokentoll diff \
           --base="${INPUT_BASE_REF}" \
           --head="${INPUT_HEAD_REF}" \
-          --calls-per-month="${INPUT_CALLS_PER_MONTH}" \
+          ${CPM_FLAG} \
           --format=json 2>/dev/null) || true
 
         DELTA=$(echo "${DIFF_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_monthly_delta', 0))" 2>/dev/null) || DELTA=0
         HAS_CHANGES=$(echo "${DIFF_JSON}" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('diffs') else 'false')" 2>/dev/null) || HAS_CHANGES=false
+        VERDICT=$(echo "${DIFF_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('verdict',{}).get('level','pass'))" 2>/dev/null) || VERDICT=pass
         echo "monthly-delta=${DELTA}" >> "$GITHUB_OUTPUT"
         echo "has-changes=${HAS_CHANGES}" >> "$GITHUB_OUTPUT"
+        echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
 
         if [ "${HAS_CHANGES}" = "true" ]; then
           COMMENT=$(tokentoll diff \
             --base="${INPUT_BASE_REF}" \
             --head="${INPUT_HEAD_REF}" \
-            --calls-per-month="${INPUT_CALLS_PER_MONTH}" \
+            ${CPM_FLAG} \
             --format=github-comment 2>&1) || true
           echo "${COMMENT}" > /tmp/tokentoll-comment.md
         fi
 
-        # First run: this PR adds tokentoll to the project.
+        # First-install PR: confirm install without posting a noisy whole-repo baseline.
         ADDS_TOKENTOLL=$(git diff "${INPUT_BASE_REF}" "${INPUT_HEAD_REF}" 2>/dev/null | grep -q "^+.*Jwrede/tokentoll" && echo true || echo false)
         if [ "${HAS_CHANGES}" = "false" ] && [ "${ADDS_TOKENTOLL}" = "true" ]; then
-          SCAN=$(tokentoll scan . \
-            --calls-per-month="${INPUT_CALLS_PER_MONTH}" \
-            --format=markdown 2>&1) || true
-          if echo "${SCAN}" | grep -q "Est. Cost/Call"; then
-            {
-              echo "## tokentoll: Initial Scan"
-              echo ""
-              echo "Here's what tokentoll found in this project. Future PRs that change LLM calls will get a cost diff comment automatically."
-              echo ""
-              echo "${SCAN}" | tail -n +2
-            } > /tmp/tokentoll-comment.md
-            echo "has-changes=true" >> "$GITHUB_OUTPUT"
-          fi
+          {
+            echo "## tokentoll installed"
+            echo ""
+            echo "Future PRs that add, remove, or change LLM API calls will receive an automatic cost-delta comment on this thread."
+            echo ""
+            echo "No baseline monthly estimate is posted on install because runtime traffic cannot be inferred from static analysis. To enable dollar estimates per call site, add a [.tokentoll.yml](https://github.com/Jwrede/tokentoll#configuration) with traffic assumptions."
+          } > /tmp/tokentoll-comment.md
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Post PR comment
@@ -94,3 +103,10 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         header: tokentoll
         path: /tmp/tokentoll-comment.md
+
+    - name: Enforce policy verdict
+      if: always() && inputs.fail-on-policy-violation == 'true' && steps.run.outputs.verdict == 'fail'
+      shell: bash
+      run: |
+        echo "::error::tokentoll policy violation: see PR comment for blocking findings"
+        exit 1
